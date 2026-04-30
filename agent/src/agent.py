@@ -35,6 +35,16 @@ logger = logging.getLogger("cadence")
 
 load_dotenv(".env.local")
 
+# LiveKit Cloud sometimes injects LIVEKIT_URL in `https://` form, but
+# downstream plugins (Beyond Presence avatar, in particular) require the
+# `wss://` WebSocket scheme and reject anything else. Coerce on startup so
+# `bey.AvatarSession.start()` never sees the wrong scheme.
+_lk_url = os.environ.get("LIVEKIT_URL", "")
+if _lk_url.startswith("https://"):
+    os.environ["LIVEKIT_URL"] = "wss://" + _lk_url[len("https://") :]
+elif _lk_url.startswith("http://"):
+    os.environ["LIVEKIT_URL"] = "ws://" + _lk_url[len("http://") :]
+
 # Hold strong references to background tasks so they aren't garbage-collected
 # mid-flight (asyncio only keeps weak refs).
 _background_tasks: set[asyncio.Task[None]] = set()

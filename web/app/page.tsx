@@ -77,21 +77,6 @@ export default function Home() {
           </div>
         </section>
 
-        <footer className="px-6 pb-10">
-          <div className="mx-auto flex w-full max-w-5xl items-center justify-between border-t border-(--border) pt-6">
-            <span className="font-mono text-[10px] uppercase tracking-[0.22em] text-(--muted)">
-              Powered by LiveKit
-            </span>
-            <a
-              href="https://docs.livekit.io/agents/"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="font-mono text-[10px] uppercase tracking-[0.22em] text-(--muted) transition-colors hover:text-foreground"
-            >
-              How it works ↗
-            </a>
-          </div>
-        </footer>
       </main>
     </>
   );
