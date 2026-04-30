@@ -647,16 +647,25 @@ function Conversation({ onSummary }: { onSummary: (s: Summary) => void }) {
     };
   }, [room]);
 
-  // Subscribe to summary text stream and lift to parent.
+  // Subscribe to summary text stream, lift to parent, then end the call
+  // from the user side. The agent publishes the summary right before saying
+  // goodbye — giving it a few seconds covers the goodbye TTS plus the avatar
+  // lip-sync delay before we disconnect the room.
   useEffect(() => {
     const handler = (reader: { readAll: () => Promise<string> }) => {
       void (async () => {
         try {
           const raw = await reader.readAll();
           const summary = JSON.parse(raw) as Summary;
-          if (summary?.conversation !== undefined) {
-            onSummaryRef.current(summary);
-          }
+          if (summary?.conversation === undefined) return;
+          onSummaryRef.current(summary);
+          setTimeout(() => {
+            try {
+              void room.disconnect();
+            } catch {
+              // already disconnected — fine
+            }
+          }, 6000);
         } catch {
           // ignore
         }
