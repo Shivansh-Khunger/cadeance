@@ -24,7 +24,7 @@ from livekit.agents import (
 )
 from livekit.agents.llm import ToolError
 from livekit.plugins import cartesia, deepgram, openai, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.plugins.turn_detector.english import EnglishModel
 from opentelemetry import trace
 
 from api_client import ApiClient, ApiError
@@ -889,9 +889,9 @@ async def cadence_session(ctx: JobContext):
         turn_handling=TurnHandlingOptions(
             # The text turn detector runs locally (ONNX, CPU) unless
             # LIVEKIT_REMOTE_EOT_URL is set, which only LiveKit Cloud hosting
-            # does. It needs the STT to report a language it supports; Deepgram
-            # `multi` reports the detected one (e.g. "en") per transcript.
-            turn_detection=MultilingualModel(),
+            # does. The English model matches the English-only STT above and
+            # takes far less memory than `MultilingualModel` (~780 MB idle).
+            turn_detection=EnglishModel(),
             # Pin VAD-based interruptions. Left unset, `dev` mode turns on
             # "adaptive" interruption handling, which calls LiveKit Inference
             # (agent-gateway.livekit.cloud). `start` already used VAD.

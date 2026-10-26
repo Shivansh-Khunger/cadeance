@@ -80,7 +80,7 @@ WORKDIR /app
 # This improves security by not running as root
 USER appuser
 
-# Run the AgentServer using UV
-# UV will activate the virtual environment and run the agent.
+# Run the AgentServer with the virtual environment's Python directly. `uv run`
+# would stay resident as an extra ~50 MB parent process.
 # The "start" command tells the AgentServer to connect to LiveKit and begin waiting for jobs.
-CMD ["uv", "run", "src/agent.py", "start"]
+CMD ["/app/.venv/bin/python", "src/agent.py", "start"]

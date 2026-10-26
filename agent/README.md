@@ -7,7 +7,7 @@ It does not use LiveKit Cloud. The worker connects to our self-hosted `livekit-s
 - STT: Deepgram Nova-3 (`deepgram` plugin)
 - LLM: DeepSeek V4.1 Flash via OpenRouter (`deepseek/deepseek-v4.1-flash-1017`, `openai.LLM.with_openrouter`), with `reasoning_effort="none"` and routing pinned to Fireworks, Together and BaseTen with no fallback
 - TTS: Cartesia Sonic-3 (`cartesia` plugin)
-- Silero VAD and the local `MultilingualModel` turn detector, both running on the worker's CPU
+- Silero VAD and the local `EnglishModel` turn detector, both running on the worker's CPU
 - Evals based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/)
 
 Mic noise suppression happens in the browser (WebRTC), not in the agent.
