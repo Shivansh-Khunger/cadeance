@@ -1,0 +1,7 @@
+# Heroku builds the agent image from agent/Dockerfile (build context: agent/)
+# and runs it as a worker dyno: the agent only makes outbound connections to
+# LiveKit and the providers, so it needs no web port. Deploy with
+# `git push heroku main`; env is set with `heroku config:set` (see agent/README.md).
+build:
+  docker:
+    worker: agent/Dockerfile
