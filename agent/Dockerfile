@@ -10,6 +10,12 @@ FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS base
 # the application crashes without emitting any logs due to buffering.
 ENV PYTHONUNBUFFERED=1
 
+# Keep the Hugging Face cache (turn-detector model, fetched by `download-files`
+# below) inside /app. The default, ~/.cache of the build stage's root user, is
+# not copied into the production stage, and the turn detector then fails with
+# `Could not find file "model_q8.onnx"`.
+ENV HF_HOME=/app/.cache/huggingface
+
 # --- Build stage ---
 # Install dependencies, build native extensions, and prepare the application
 FROM base AS build
