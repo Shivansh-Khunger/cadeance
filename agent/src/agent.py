@@ -17,42 +17,72 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     RunContext,
+    TurnHandlingOptions,
     cli,
     function_tool,
-    inference,
+    room_io,
 )
 from livekit.agents.llm import ToolError
-from livekit.plugins import bey, silero
+from livekit.plugins import cartesia, deepgram, openai, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from opentelemetry import trace
 
 from api_client import ApiClient, ApiError
-from cost import compute_cost
+from cost import compute_cost, merge_llm_cost
+from openrouter_stats import GenerationStats, create_generation_stats
 from summary import TOPIC as SUMMARY_TOPIC
 from summary import generate_summary
+from telemetry import CallTrace, api_error_attributes, setup_telemetry, start_call_span
 from tool_events import ToolEventReporter
 
 logger = logging.getLogger("cadence")
 
 load_dotenv(".env.local")
 
-# LiveKit Cloud sometimes injects LIVEKIT_URL in `https://` form, but
-# downstream plugins (Beyond Presence avatar, in particular) require the
-# `wss://` WebSocket scheme and reject anything else. Coerce on startup so
-# `bey.AvatarSession.start()` never sees the wrong scheme.
+# LIVEKIT_URL may be configured in `http(s)://` form (the same host serves
+# HTTP and WebSocket). Coerce it to the `ws(s)://` scheme on startup so anything
+# that reads the variable (the worker, SDK helpers) always sees a WebSocket URL.
 _lk_url = os.environ.get("LIVEKIT_URL", "")
 if _lk_url.startswith("https://"):
-    os.environ["LIVEKIT_URL"] = "wss://" + _lk_url[len("https://") :]
+    os.environ["LIVEKIT_URL"] = "wss://" + _lk_url[len("https://"):]
 elif _lk_url.startswith("http://"):
-    os.environ["LIVEKIT_URL"] = "ws://" + _lk_url[len("http://") :]
+    os.environ["LIVEKIT_URL"] = "ws://" + _lk_url[len("http://"):]
 
 # Hold strong references to background tasks so they aren't garbage-collected
 # mid-flight (asyncio only keeps weak refs).
 _background_tasks: set[asyncio.Task[None]] = set()
 
-AGENT_MODEL = "xai/grok-4-1-fast-non-reasoning"
-DEFAULT_BEY_AVATAR_ID = "694c83e2-8895-4a98-bd16-56332ca3f449"
-BEY_AVATAR_ID = os.getenv("BEY_AVATAR_ID", DEFAULT_BEY_AVATAR_ID)
+# OpenRouter model id (openrouter.ai/api/v1/models), called through
+# `openai.LLM.with_openrouter` (reads OPENROUTER_API_KEY). `build_agent_llm`
+# sends `reasoning_effort`, OpenRouter's shorthand for `reasoning.effort`
+# ("none" disables reasoning).
+#
+# Experiment (2026-10-26): DeepSeek V4.1 Flash, the 2026-09-10 snapshot, pinned
+# to BaseTen's standard endpoint (OpenRouter endpoint 1df51a79-…, $0.30/$1.20,
+# not `baseten/fast`), picked for its p99 latency. With one pinned host and no
+# fallback, `:nitro` (sort by throughput) has nothing to choose between.
+# `require_parameters` keeps us on endpoints that honour reasoning-off and tools.
+# To revert to the previous setup: AGENT_MODEL =
+# "deepseek/deepseek-v4.1-flash-1017" and "order": ["fireworks", "together",
+# "baseten"]. gpt-oss-120b:nitro was tried and dropped (2026-10-25): its
+# reasoning can't be disabled. DeepSeek's first-party endpoint is excluded by
+# the account's no-training guardrail.
+AGENT_MODEL = "deepseek/deepseek-v4.1-flash-20260910:nitro"
+AGENT_REASONING_EFFORT: openai.llm.ReasoningEffort = "none"
+_OPENROUTER_PROVIDER: openai.OpenRouterProviderPreferences = {
+    "sort": ["latency"],
+    "allow_fallbacks": False,
+    "require_parameters": True,
+}
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:4000")
+# Upper bound on how long the job waits at shutdown (after hang-up and the
+# summary) for OpenRouter generation stats still being fetched. Stats can lag
+# the response by 20 s, so the goodbye turn's stats need most of this.
+GENERATION_STATS_DRAIN_SECONDS = 30.0
+# Closing the session (`end_conversation` does, after the goodbye) deletes the
+# room, which disconnects the caller and ends the job. Without it the agent
+# stays in the room until livekit-server's empty-room timeout closes it.
+ROOM_OPTIONS = room_io.RoomOptions(delete_room_on_close=True)
 
 # Cartesia Sonic-3 SSML directives. We let the LLM emit these inline so the TTS
 # sounds expressive, then strip them from the published transcript so the UI
@@ -64,6 +94,15 @@ _NONVERBAL = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_PUNCTUATION = {".", "!", "?"}
+
+
+def build_agent_llm() -> openai.LLM:
+    """The agent's LLM (also used for the end-of-call summary and in tests)."""
+    return openai.LLM.with_openrouter(
+        model=AGENT_MODEL,
+        reasoning_effort=AGENT_REASONING_EFFORT,
+        provider=_OPENROUTER_PROVIDER,
+    )
 
 
 def _strip_voice_directives(text: str) -> str:
@@ -93,7 +132,7 @@ async def _ensure_terminal_punctuation(
 ) -> AsyncGenerator[str, None]:
     # If the LLM finishes on an SSML tag (e.g. `<emotion value="excited"/>`)
     # or trails off without `.`/`!`/`?`, Cartesia closes the stream on a
-    # non-utterance boundary and the avatar can clip the final phoneme.
+    # non-utterance boundary and can clip the final phoneme.
     # Append a period so there's always a clean prosodic ending.
     last_nonws = ""
     async for chunk in text:
@@ -156,6 +195,10 @@ class CadenceUserData:
     # Set by `end_conversation` so the shutdown hook doesn't double-save when
     # the call ends gracefully. Stays False if the caller hangs up.
     finalized: bool = False
+    # Errors and call attributes on the trace (no-op when telemetry is off).
+    telemetry: CallTrace | None = None
+    # OpenRouter stats per generation; None when telemetry is off.
+    generations: GenerationStats | None = None
 
 
 def _require_user(context: RunContext[CadenceUserData]) -> dict[str, Any]:
@@ -173,6 +216,28 @@ def _require_api(context: RunContext[CadenceUserData]) -> ApiClient:
     if api is None:
         raise ToolError("The booking system is unavailable right now.")
     return api
+
+
+def _tool_api_error(
+    context: RunContext[CadenceUserData], e: ApiError, message: str | None = None
+) -> ToolError:
+    """Record an API failure on the trace (HTTP status on the `function_tool`
+    span, plus a `cadence_error`) and return the ToolError for the LLM."""
+    if context.userdata.telemetry is not None:
+        context.userdata.telemetry.mark_tool_api_error(e.status, e.message, e)
+    return ToolError(message or e.message)
+
+
+def _record_save_error(userdata: "CadenceUserData", e: Exception) -> None:
+    if userdata.telemetry is None:
+        return
+    if isinstance(e, ApiError):
+        attrs = api_error_attributes(
+            "api", e.status, f"save conversation: {e.message}")
+    else:
+        attrs = api_error_attributes("api", 0, f"save conversation: {e}")
+        attrs["cadence.error.type"] = type(e).__name__
+    userdata.telemetry.record_error(attrs, exception=e)
 
 
 def _summarize_appointment(appt: dict[str, Any]) -> dict[str, Any]:
@@ -209,9 +274,27 @@ def _build_save_payload(
             datetime.now(timezone.utc) - userdata.started_at
         ).total_seconds()
     try:
-        usage = getattr(session, "usage", None) if session is not None else None
-        cost = compute_cost(usage, duration_seconds=duration_seconds)
+        usage = getattr(session, "usage",
+                        None) if session is not None else None
+        # The real OpenRouter charge of the generations fetched so far; the
+        # rest (e.g. the summary's own calls, just made) use the rate table.
+        known = userdata.generations.known_cost() if userdata.generations else None
+        cost = compute_cost(
+            usage, duration_seconds=duration_seconds, known_llm=known)
         payload.update(cost)
+        if userdata.telemetry is not None and known is not None:
+            llm = cost["costBreakdown"].get("llm") or {}
+            llm_usd, llm_source = merge_llm_cost(
+                llm.get("inputTokens", 0), llm.get("outputTokens", 0), known
+            )
+            userdata.telemetry.set_call_attributes(
+                {
+                    "cadence.cost.cents": cost["costCents"],
+                    "cadence.cost.llm_usd": llm_usd,
+                    "cadence.cost.llm_source": llm_source,
+                    "cadence.cost.llm_generations_priced": known.generations,
+                }
+            )
     except Exception:
         logger.exception("cost approximation failed")
     # The API treats omitted fields as optional but rejects explicit JSON null
@@ -375,9 +458,12 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
             try:
                 data = await api.identify_user(phone, name)
             except ApiError as e:
-                raise ToolError(e.message) from e
+                raise _tool_api_error(context, e) from e
             user = data["user"]
             context.userdata.user = user
+            # TODO(observability): don't set `langfuse.user.id` from the
+            # caller's phone or name until the PII decision is made
+            # (.scratch/observability/spec.md, "Open decisions").
             stored_name = user.get("name")
             display_name = stored_name or "the caller"
             if data.get("isNew"):
@@ -475,13 +561,14 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
             try:
                 all_slots = await api.get_slots(days_ahead)
             except ApiError as e:
-                raise ToolError(e.message) from e
+                raise _tool_api_error(context, e) from e
 
             # Group by calendar day so the LLM can answer "tomorrow at 10"
             # even if today still has slots left. Cap to 5 days, 5 slots each.
             by_day: dict[str, dict[str, Any]] = {}
             for iso in all_slots:
-                dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+                dt = datetime.fromisoformat(
+                    iso.replace("Z", "+00:00")).astimezone()
                 key = dt.date().isoformat()
                 if key not in by_day:
                     by_day[key] = {
@@ -496,7 +583,8 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
             flat = [s["iso"] for d in days_out for s in d["slots"]]
             context.userdata.last_slot_offer = flat
             total = sum(len(d["slots"]) for d in days_out)
-            reporter.success(f"Found {total} open slots across {len(days_out)} day(s)")
+            reporter.success(
+                f"Found {total} open slots across {len(days_out)} day(s)")
             if total == 0:
                 return (
                     "No open slots in that window. Apologize and offer to "
@@ -537,6 +625,8 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
                 data = await api.book_appointment(user["phone"], starts_at, notes)
             except ApiError as e:
                 if e.status == 409:
+                    # Still an API error on the trace (the slot was taken).
+                    _tool_api_error(context, e)
                     # Another caller (or another tab) grabbed this slot between
                     # fetch_slots and book. Pull fresh availability and hand
                     # the LLM 2-3 nearby alternatives in a single round-trip.
@@ -557,7 +647,7 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
                         "Apologize briefly, offer these to the caller, and ask "
                         "which they prefer."
                     ) from e
-                raise ToolError(e.message) from e
+                raise _tool_api_error(context, e) from e
             pretty = _humanize_slot(data["appointment"]["startsAt"])
             reporter.success(
                 f"Booked for {pretty}",
@@ -586,8 +676,9 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
             try:
                 data = await api.list_appointments(user["phone"])
             except ApiError as e:
-                raise ToolError(e.message) from e
-            rows = [_summarize_appointment(a) for a in data.get("appointments", [])]
+                raise _tool_api_error(context, e) from e
+            rows = [_summarize_appointment(a)
+                    for a in data.get("appointments", [])]
             active = [r for r in rows if r["status"] == "booked"]
             reporter.success(
                 f"Found {len(rows)} appointments ({len(active)} active)",
@@ -619,7 +710,7 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
             try:
                 data = await api.cancel_appointment(appointment_id, user["phone"])
             except ApiError as e:
-                raise ToolError(e.message) from e
+                raise _tool_api_error(context, e) from e
             pretty = _humanize_slot(data["appointment"]["startsAt"])
             reporter.success(f"Cancelled {pretty}")
             return f"Cancelled. Confirm to the caller that {pretty} is now cancelled."
@@ -651,7 +742,7 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
                     appointment_id, user["phone"], starts_at=starts_at
                 )
             except ApiError as e:
-                raise ToolError(e.message) from e
+                raise _tool_api_error(context, e) from e
             pretty = _humanize_slot(data["appointment"]["startsAt"])
             reporter.success(f"Moved to {pretty}")
             return (
@@ -708,8 +799,9 @@ If the user asks who you are, introduce yourself as Cadence at a healthcare fron
                 # Mark only after a successful save so a failed save here gets
                 # a second chance from the shutdown hook.
                 context.userdata.finalized = True
-            except Exception:
+            except Exception as e:
                 logger.exception("failed to persist conversation")
+                _record_save_error(context.userdata, e)
 
             reporter.success("Sent summary to caller")
 
@@ -740,6 +832,15 @@ server.setup_fnc = prewarm
 
 @server.rtc_session(agent_name="cadence")
 async def cadence_session(ctx: JobContext):
+    # Tracing first, so every span of the call goes to Langfuse. No-op (None)
+    # when the LANGFUSE_* vars are unset. See telemetry.py.
+    tracer_provider = setup_telemetry(ctx.room.name, ctx.job.id)
+    call_span = start_call_span(ctx.room.name, ctx.job.id, tracer_provider)
+    call_trace = CallTrace(tracer_provider, call_span)
+    # OpenRouter stats (provider, latency, real cost) per generation, fetched
+    # in the background; None when telemetry is off. See openrouter_stats.py.
+    generations = create_generation_stats(tracer_provider, call_span)
+
     # Logging setup
     # Add any other context you want in all log entries here
     ctx.log_context_fields = {
@@ -751,28 +852,54 @@ async def cadence_session(ctx: JobContext):
     userdata.room = ctx.room
     userdata.room_name = ctx.room.name
     userdata.started_at = datetime.now(timezone.utc)
+    userdata.telemetry = call_trace
+    userdata.generations = generations
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
+    # Voice pipeline: Deepgram STT and Cartesia TTS called directly through
+    # their LiveKit plugins, and the LLM (DeepSeek V4.1 Flash) through the OpenRouter
+    # gateway, with our own API keys (DEEPGRAM_API_KEY, OPENROUTER_API_KEY,
+    # CARTESIA_API_KEY), plus the local LiveKit turn detector. STT and TTS stay
+    # direct because OpenRouter has no streaming STT, and no streaming Cartesia
+    # Sonic-3 TTS for the inline tags (self-host-livekit ticket 09).
+    agent_llm = build_agent_llm()
+    if generations is not None:
+        # Per-plugin event (the session-level one is deprecated). The summary
+        # uses the same LLM instance (`session.llm`), so its calls count too.
+        agent_llm.on("metrics_collected", generations.on_metrics)
+
     session = AgentSession[CadenceUserData](
         userdata=userdata,
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm=inference.LLM(model=AGENT_MODEL),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=inference.TTS(
-            model="cartesia/sonic-3", voice="cbaf8084-f009-4838-a096-07ee2e6612b1"
-        ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
-        turn_detection=MultilingualModel(),
+        # Speech-to-text: the agent's ears.
+        # See https://docs.livekit.io/agents/models/stt/plugins/deepgram/
+        # experiment; was "multi"
+        stt=deepgram.STT(model="nova-3", language="en"),
+        # LLM: the agent's brain. OpenRouter via the OpenAI plugin's Chat
+        # Completions client. See
+        # https://docs.livekit.io/agents/models/llm/openrouter/
+        llm=agent_llm,
+        # Text-to-speech: the agent's voice. The plugin sends the LLM text to
+        # Cartesia verbatim, so the inline Sonic-3 tags in the prompt
+        # (`<emotion …/>`, `<speed …/>`, `[laughter]`) reach Cartesia as-is.
+        # See https://docs.livekit.io/agents/models/tts/plugins/cartesia/
+        tts=cartesia.TTS(
+            model="sonic-3", voice="cbaf8084-f009-4838-a096-07ee2e6612b1"),
+        # VAD and turn detection decide when the user is speaking and when the
+        # agent should respond. See https://docs.livekit.io/agents/logic/turns/
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
+        turn_handling=TurnHandlingOptions(
+            # The text turn detector runs locally (ONNX, CPU) unless
+            # LIVEKIT_REMOTE_EOT_URL is set, which only LiveKit Cloud hosting
+            # does. It needs the STT to report a language it supports; Deepgram
+            # `multi` reports the detected one (e.g. "en") per transcript.
+            turn_detection=MultilingualModel(),
+            # Pin VAD-based interruptions. Left unset, `dev` mode turns on
+            # "adaptive" interruption handling, which calls LiveKit Inference
+            # (agent-gateway.livekit.cloud). `start` already used VAD.
+            interruption={"mode": "vad"},
+            # Let the LLM start its reply while waiting for the end of turn.
+            # See https://docs.livekit.io/agents/build/audio/#preemptive-generation
+            preemptive_generation={"enabled": True},
+        ),
         # Setting tts_text_transforms replaces the defaults, so list them
         # explicitly. The terminal-punctuation guard fires after the LLM stream
         # ends and stops Cartesia from cutting the last phoneme when a reply
@@ -786,10 +913,12 @@ async def cadence_session(ctx: JobContext):
         user_away_timeout=12.0,
     )
 
-    avatar = bey.AvatarSession(avatar_id=BEY_AVATAR_ID)
-    await avatar.start(session, room=ctx.room)
-
     agent = Cadence()
+
+    # STT/LLM/TTS errors (with `recoverable`) and the close reason go on the
+    # trace as `cadence_error` spans / `cadence_call` attributes.
+    session.on("error", call_trace.on_session_error)
+    session.on("close", call_trace.on_session_close)
 
     # When the caller goes silent past `user_away_timeout`, the SDK transitions
     # the user state to "away". Nudge them once so the call doesn't stall.
@@ -836,25 +965,52 @@ async def cadence_session(ctx: JobContext):
                                 session=session,
                             )
                         )
-                except Exception:
-                    logger.exception("failed to persist conversation on shutdown")
+                except Exception as e:
+                    logger.exception(
+                        "failed to persist conversation on shutdown")
+                    _record_save_error(userdata, e)
         finally:
             try:
                 await api.aclose()
             except Exception:
                 logger.exception("api client close failed")
 
-    ctx.add_shutdown_callback(_finalize_on_shutdown)
+    async def _on_shutdown() -> None:
+        # Shutdown callbacks run concurrently, so the summary and the flush
+        # share one callback to keep them in order. Running the summary under
+        # the call span keeps its LLM spans in the call's trace.
+        with trace.use_span(call_span, end_on_exit=True):
+            await _finalize_on_shutdown()
+            if generations is not None:
+                # After hang-up and the summary: wait (bounded) for the stats
+                # still in flight, including the summary's own calls.
+                try:
+                    await generations.drain(timeout=GENERATION_STATS_DRAIN_SECONDS)
+                    call_trace.set_call_attributes(
+                        generations.call_attributes())
+                finally:
+                    await generations.aclose()
+            call_trace.finish()
+        if tracer_provider is not None:
+            # The SDK also shuts the provider down at job cleanup; flushing
+            # here (off the event loop) is the docs' belt-and-braces.
+            await asyncio.to_thread(tracer_provider.force_flush, 5000)
 
-    # Noise cancellation runs in the browser via @livekit/krisp-noise-filter,
-    # so we don't apply it server-side here.
-    await session.start(
-        agent=agent,
-        room=ctx.room,
-    )
+    ctx.add_shutdown_callback(_on_shutdown)
 
-    # Join the room and connect to the user
-    await ctx.connect()
+    # Make the call span current so `agent_session` and every span under it
+    # (turns, LLM, TTS, tools) join the call's trace.
+    with trace.use_span(call_span, end_on_exit=False):
+        # Noise cancellation runs in the browser via @livekit/krisp-noise-filter,
+        # so we don't apply it server-side here.
+        await session.start(
+            agent=agent,
+            room=ctx.room,
+            room_options=ROOM_OPTIONS,
+        )
+
+        # Join the room and connect to the user
+        await ctx.connect()
 
 
 if __name__ == "__main__":

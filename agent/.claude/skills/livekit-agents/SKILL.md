@@ -1,66 +1,45 @@
 ---
 name: livekit-agents
-description: 'Build voice AI agents with LiveKit Cloud and the Agents SDK. Use when the user asks to "build a voice agent", "create a LiveKit agent", "add voice AI", "implement handoffs", "structure agent workflows", or is working with LiveKit Agents SDK. Provides opinionated guidance for the recommended path: LiveKit Cloud + LiveKit Inference. REQUIRES writing tests for all implementations.'
+description: 'Build and change the Cadence voice agent on the LiveKit Agents SDK, self-hosted: our own livekit-server plus Deepgram and Cartesia plugins and an OpenRouter-backed LLM, never LiveKit Cloud or LiveKit Inference. Use when the user asks to "build a voice agent", "add voice AI", add tools, "implement handoffs", "structure agent workflows", change STT/LLM/TTS, turn detection or interruptions, or is working with LiveKit Agents SDK. REQUIRES writing tests for all implementations.'
 license: MIT
 metadata:
-  author: livekit
-  version: "0.3.0"
+  author: livekit (adapted for self-hosting)
+  version: "0.3.0-selfhost"
 ---
 
-# LiveKit Agents Development for LiveKit Cloud
+# LiveKit Agents Development, Self-Hosted
 
-This skill provides opinionated guidance for building voice AI agents with LiveKit Cloud. It assumes you are using LiveKit Cloud (the recommended path) and encodes *how to approach* agent development, not API specifics. All factual information about APIs, methods, and configurations must come from live documentation.
+This skill encodes *how to approach* voice agent development in this repo, not API specifics. All factual information about APIs, methods, and configurations must come from live documentation.
 
-**This skill is for LiveKit Cloud developers.** If you're self-hosting LiveKit, some recommendations (particularly around LiveKit Inference) won't apply directly.
+This repo runs the open-source `livekit-server` itself (`infra/livekit/`) and calls the model providers with our own keys: Deepgram STT and Cartesia TTS directly through their plugins, and the LLM (DeepSeek V4.1 Flash) through OpenRouter via `openai.LLM.with_openrouter`. It never uses LiveKit Cloud, LiveKit Inference (`inference.*` classes or model strings like `"deepgram/nova-3"`), Cloud agent hosting (`lk agent deploy`, `livekit.toml`), or Krisp/Cloud noise cancellation. The why is in `docs/adr/0001-self-host-livekit.md`.
 
 ## MANDATORY: Read This Checklist Before Starting
 
 Before writing ANY code, complete this checklist:
 
 1. **Read this entire skill document** - Do not skip sections even if MCP is available
-2. **Ensure LiveKit Cloud project is connected** - You need `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` from your Cloud project
-3. **Set up documentation access** - Use MCP if available, otherwise use web search
+2. **Have the self-hosted stack running** - Local server up and `agent/.env.local` filled in (see the rules below)
+3. **Set up documentation access** - Use the `lk docs` CLI or MCP if available, otherwise use web search
 4. **Plan to write tests** - Every agent implementation MUST include tests (see testing section below)
 5. **Verify all APIs against live docs** - Never rely on model memory for LiveKit APIs
 
 This checklist applies regardless of whether MCP is available. MCP provides documentation access but does NOT replace the guidance in this skill.
 
-## LiveKit Cloud Setup
+## Self-Hosting Rules
 
-LiveKit Cloud is the fastest way to get a voice agent running. It provides:
-- Managed infrastructure (no servers to deploy)
-- **LiveKit Inference** for AI models (no separate API keys needed)
-- Built-in noise cancellation, turn detection, and other voice features
-- Simple credential management
+The live docs default to LiveKit Cloud + LiveKit Inference in their examples. Translate every example to the self-hosted setup with these rules:
 
-### Connect to Your Cloud Project
-
-1. Sign up at [cloud.livekit.io](https://cloud.livekit.io) if you haven't already
-2. Create a project (or use an existing one)
-3. Get your credentials from the project settings:
-   - `LIVEKIT_URL` - Your project's WebSocket URL (e.g., `wss://your-project.livekit.cloud`)
-   - `LIVEKIT_API_KEY` - API key for authentication
-   - `LIVEKIT_API_SECRET` - API secret for authentication
-
-4. Set these as environment variables (typically in `.env.local`):
-```bash
-LIVEKIT_URL=wss://your-project.livekit.cloud
-LIVEKIT_API_KEY=your-api-key
-LIVEKIT_API_SECRET=your-api-secret
-```
-
-The LiveKit CLI can automate credential setup. Consult the CLI documentation for current commands.
-
-### Use LiveKit Inference for AI Models
-
-**LiveKit Inference is the recommended way to use AI models with LiveKit Cloud.** It provides access to leading AI model providers—all through your LiveKit credentials with no separate API keys needed.
-
-Benefits of LiveKit Inference:
-- No separate API keys to manage for each AI provider
-- Billing consolidated through your LiveKit Cloud account
-- Optimized for voice AI workloads
-
-Consult the documentation for available models, supported providers, and current usage patterns. The documentation always has the most up-to-date information.
+- **Local server:** start it as `infra/livekit/README.md` describes.
+- **Env keys:** `agent/.env.example` lists every key the worker needs (`DEEPGRAM_API_KEY`, `OPENROUTER_API_KEY`, `CARTESIA_API_KEY`, plus the LiveKit server pair). Copy it to `.env.local`.
+- **OpenRouter:** it is a third-party gateway, not LiveKit Cloud or LiveKit Inference, so using it keeps us self-hosted. It carries the LLM only. Keep STT and TTS on direct plugins unless OpenRouter gains a streaming STT, or a streaming TTS that keeps the Cartesia inline tags; its `/audio/speech` and `/audio/transcriptions` endpoints are request/response, which would add whole-utterance latency to every turn. Keep the model pinned (`provider` routing in `build_agent_llm`) and reasoning off.
+- **Run:** `uv run src/agent.py download-files` once (the turn detector loads its model from disk only), then `dev` locally or `start` in production.
+- **Interruptions:** keep `interruption={"mode": "vad"}` pinned in the session's turn handling. Any other mode, or leaving it unset in `dev`, calls adaptive interruption on the Cloud gateway.
+- **Turn detector:** keep the local `MultilingualModel`. On an upgrade to its successor, pin the mini/local variant (`v1-mini`): the full model runs on LiveKit Inference.
+- **Worker env:** leave `LIVEKIT_REMOTE_EOT_URL`, `LIVEKIT_INFERENCE_URL` and `LIVEKIT_OBSERVABILITY_URL` unset. Each one makes the worker call LiveKit-operated hosts.
+- **New model or provider:** for an LLM, change `AGENT_MODEL` to another OpenRouter id and re-check its reasoning-off switch, tool support and provider pinning against `openrouter.ai/api/v1/models/<id>/endpoints`. For STT/TTS, add the plugin extra to `livekit-agents[...]` in `agent/pyproject.toml`, construct the plugin class, and add its key to `agent/.env.example`. Inference model strings are not an option.
+- **New SDK feature:** before using it, check the docs and the installed source for calls to `agent-gateway.livekit.cloud`. Known cases: the audio `inference.TurnDetector` and adaptive interruption. A feature that routes there is off-limits.
+- **SDK version:** the docs track the newest release; this repo pins `livekit-agents` in `agent/pyproject.toml`. When they disagree, the installed source in `agent/.venv` wins.
+- **Observability:** Cloud Agent Observability (session reports, traces) is unavailable. The SDK's OpenTelemetry spans go to Langfuse instead, through `src/telemetry.py` (`livekit.agents.telemetry.set_tracer_provider` with our own OTLP exporter, set inside the job); see the README's Tracing section. Also use worker logs and `session.usage`.
 
 ## Critical Rule: Never Trust Model Memory for LiveKit APIs
 
@@ -73,29 +52,29 @@ LiveKit Agents is a fast-evolving SDK. Model training data is outdated the momen
 
 This rule applies even when confident about an API. Verify anyway.
 
-## REQUIRED: Use LiveKit MCP Server for Documentation
+## REQUIRED: Use Live LiveKit Documentation
 
-Before writing any LiveKit code, ensure access to the LiveKit documentation MCP server. This provides current, verified API information and prevents reliance on stale model knowledge.
+Before writing any LiveKit code, ensure access to live LiveKit documentation. This provides current, verified API information and prevents reliance on stale model knowledge.
 
-### Check for MCP Availability
+### Check for the CLI or MCP
 
-Look for `livekit-docs` MCP tools. If available, use them for all documentation lookups:
+Use the `lk docs` CLI (commands and install steps in `agent/AGENTS.md`) or the `livekit-docs` MCP tools, whichever is available, for all documentation lookups:
 - Search documentation before implementing any feature
 - Verify API signatures and method parameters
 - Look up configuration options and their valid values
 - Find working examples for the specific task at hand
 
-### If MCP Is Not Available
+### If Neither Is Available
 
-If the LiveKit MCP server is not configured, inform the user and recommend installation. Installation instructions for all supported platforms are available at:
+If neither the CLI nor the MCP server is set up, inform the user and recommend installation. Installation instructions for all supported platforms are available at:
 
 **https://docs.livekit.io/intro/mcp-server/**
 
 Fetch the installation instructions appropriate for the user's coding agent from that page.
 
-### Fallback When MCP Unavailable
+### Fallback When Neither Is Available
 
-If MCP cannot be installed in the current session:
+If neither can be installed in the current session:
 1. **Inform the user immediately** that documentation cannot be verified in real-time
 2. Use web search to fetch current documentation from docs.livekit.io
 3. **Explicitly mark all LiveKit-specific code** with a comment like `# UNVERIFIED: Please check docs.livekit.io for current API`
@@ -110,7 +89,7 @@ Voice AI agents have fundamentally different requirements than text-based agents
 
 Voice conversations are real-time. Users expect responses within hundreds of milliseconds, not seconds. Every architectural decision should consider latency impact:
 
-- Minimize LLM context size to reduce inference time
+- Minimize LLM context size to reduce time to first token
 - Avoid unnecessary tool calls during active conversation
 - Prefer streaming responses over batch responses
 - Design for the unhappy path (network delays, API timeouts)
@@ -210,7 +189,7 @@ Focus tests on:
 
 ### Test Implementation Pattern
 
-Use LiveKit's testing framework. Consult the testing documentation via MCP for current patterns:
+Use LiveKit's testing framework. Consult the testing documentation for current patterns:
 ```
 search: "livekit agents testing"
 ```
@@ -263,7 +242,7 @@ Reiterating the critical rule: never trust model memory for LiveKit APIs. The SD
 - API method signatures and parameters
 - Configuration options and their valid values
 - SDK version-specific features or changes
-- Deployment and infrastructure setup
+- Deployment and infrastructure setup (this repo's own setup: the files named in Self-Hosting Rules)
 - Model provider integration details
 - CLI commands and flags
 
@@ -277,17 +256,17 @@ The distinction matters: this skill tells you *how to think* about building voic
 
 ## Feedback Loop
 
-When using LiveKit documentation via MCP, note any gaps, outdated information, or confusing content. Reporting documentation issues helps improve the ecosystem for all developers.
+When using LiveKit documentation via the CLI or MCP, note any gaps, outdated information, or confusing content. Reporting documentation issues helps improve the ecosystem for all developers.
 
 ## Summary
 
-Building effective voice agents with LiveKit Cloud requires:
+Building effective voice agents in this repo requires:
 
-1. **Use LiveKit Cloud + LiveKit Inference** as the foundation—it's the fastest path to production
+1. **Stay self-hosted**: our own LiveKit server, direct STT/TTS plugins and the OpenRouter LLM, per the Self-Hosting Rules
 2. **Verify everything** against live documentation—never trust model memory
 3. **Minimize latency** at every architectural decision point
 4. **Structure workflows** using handoffs and tasks to manage complexity
 5. **Test behavior** before and after changes—never ship without tests
 6. **Keep context minimal**—only include what's needed for the current phase
 
-These principles remain valid regardless of SDK version or API changes. For all implementation specifics, consult the LiveKit documentation via MCP.
+These principles remain valid regardless of SDK version or API changes. For all implementation specifics, consult the live LiveKit documentation.

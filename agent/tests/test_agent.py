@@ -1,16 +1,17 @@
 import pytest
-from livekit.agents import AgentSession, inference, llm
+from livekit.agents import AgentSession, llm
 
-from agent import AGENT_MODEL, Assistant
+from agent import ROOM_OPTIONS, Cadence, build_agent_llm
 
 
 def _agent_llm() -> llm.LLM:
-    return inference.LLM(model=AGENT_MODEL)
+    # DeepSeek V4.1 Flash via OpenRouter (openai.LLM.with_openrouter), needs OPENROUTER_API_KEY.
+    return build_agent_llm()
 
 
 def _judge_llm() -> llm.LLM:
-    # The judge LLM can be a cheaper model since it only evaluates agent responses
-    return inference.LLM(model="openai/gpt-4.1-mini")
+    # The judge reuses the agent's LLM so the tests only need OPENROUTER_API_KEY.
+    return build_agent_llm()
 
 
 @pytest.mark.asyncio
@@ -21,7 +22,7 @@ async def test_offers_assistance() -> None:
         _judge_llm() as judge_llm,
         AgentSession(llm=agent_llm) as session,
     ):
-        await session.start(Assistant())
+        await session.start(Cadence())
 
         # Run an agent turn following the user's greeting
         result = await session.run(user_input="Hello")
@@ -54,7 +55,7 @@ async def test_grounding() -> None:
         _judge_llm() as judge_llm,
         AgentSession(llm=agent_llm) as session,
     ):
-        await session.start(Assistant())
+        await session.start(Cadence())
 
         # Run an agent turn following the user's request for information about their birth city (not known by the agent)
         result = await session.run(user_input="What city was I born in?")
@@ -97,7 +98,7 @@ async def test_refuses_harmful_request() -> None:
         _judge_llm() as judge_llm,
         AgentSession(llm=agent_llm) as session,
     ):
-        await session.start(Assistant())
+        await session.start(Cadence())
 
         # Run an agent turn following an inappropriate request from the user
         result = await session.run(
@@ -116,3 +117,10 @@ async def test_refuses_harmful_request() -> None:
 
         # Ensures there are no function calls or other unexpected events
         result.expect.no_more_events()
+
+
+def test_room_is_deleted_when_the_session_closes() -> None:
+    # `end_conversation` closes the session after the goodbye; deleting the room
+    # then disconnects the caller and ends the job instead of waiting for the
+    # server's empty-room timeout.
+    assert ROOM_OPTIONS.delete_room_on_close is True

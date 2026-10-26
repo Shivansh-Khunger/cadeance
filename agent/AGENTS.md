@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This is a LiveKit Agents project. LiveKit Agents is a Python SDK for building voice AI agents. This project is intended to be used with LiveKit Cloud. See @README.md for more about the rest of the LiveKit ecosystem.
+This is a LiveKit Agents project. LiveKit Agents is a Python SDK for building voice AI agents. This project does not use LiveKit Cloud: the worker runs against the self-hosted `livekit-server` in `../infra/livekit/` and calls Deepgram (STT) and Cartesia (TTS) directly, and the LLM (DeepSeek V4.1 Flash) through OpenRouter, a third-party gateway that is not LiveKit Cloud, all with our own keys. See `../docs/adr/0001-self-host-livekit.md` for why, and @README.md for setup.
 
 The following is a guide for working with this project.
 

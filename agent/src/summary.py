@@ -144,9 +144,7 @@ async def _extract_intent(summarizer: lk_llm.LLM, transcript: str) -> str:
         return "unknown"
 
 
-async def _extract_preferences(
-    summarizer: lk_llm.LLM, transcript: str
-) -> list[str]:
+async def _extract_preferences(summarizer: lk_llm.LLM, transcript: str) -> list[str]:
     if not transcript:
         return []
     ctx = lk_llm.ChatContext()

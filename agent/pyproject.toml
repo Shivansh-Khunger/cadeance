@@ -9,10 +9,13 @@ description = "Simple voice AI assistant built with LiveKit Agents for Python"
 requires-python = ">=3.10, <3.15"
 
 dependencies = [
-    "livekit-agents[silero,turn-detector,bey]~=1.5",
-    "livekit-plugins-noise-cancellation~=0.2",
+    "livekit-agents[cartesia,deepgram,openai,silero,turn-detector]~=1.5",
     "python-dotenv",
     "httpx>=0.27",
+    # Traces to Langfuse (src/telemetry.py). Already locked through
+    # livekit-agents (~=1.39.0); declared because we import them directly.
+    "opentelemetry-sdk~=1.39.1",
+    "opentelemetry-exporter-otlp-proto-http~=1.39.1",
 ]
 
 [dependency-groups]

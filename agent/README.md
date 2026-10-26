@@ -1,23 +1,16 @@
-<a href="https://livekit.io/">
-  <img src="./.github/assets/livekit-mark.png" alt="LiveKit logo" width="100" height="100">
-</a>
+# Cadence agent (Python)
 
-# LiveKit Agents Starter - Python
+The voice agent worker for Cadence, built on [LiveKit Agents for Python](https://github.com/livekit/agents) (1.5.x).
 
-A complete starter project for building voice AI apps with [LiveKit Agents for Python](https://github.com/livekit/agents) and [LiveKit Cloud](https://cloud.livekit.io/).
+It does not use LiveKit Cloud. The worker connects to our self-hosted `livekit-server` (`../infra/livekit/`) and calls the model providers with our own keys (see `../docs/adr/0001-self-host-livekit.md`). STT and TTS are called directly. The LLM goes through [OpenRouter](https://openrouter.ai), a third-party gateway (not LiveKit Cloud or LiveKit Inference), so self-hosting still holds:
 
-The starter project includes:
+- STT: Deepgram Nova-3 (`deepgram` plugin)
+- LLM: DeepSeek V4.1 Flash via OpenRouter (`deepseek/deepseek-v4.1-flash-1017`, `openai.LLM.with_openrouter`), with `reasoning_effort="none"` and routing pinned to Fireworks, Together and BaseTen with no fallback
+- TTS: Cartesia Sonic-3 (`cartesia` plugin)
+- Silero VAD and the local `MultilingualModel` turn detector, both running on the worker's CPU
+- Evals based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/)
 
-- A simple voice AI assistant, ready for extension and customization
-- A voice AI pipeline built on [LiveKit Inference](https://docs.livekit.io/agents/models/inference)
-  with [models](https://docs.livekit.io/agents/models) from OpenAI, Cartesia, and Deepgram. More than 50 other model providers are supported, including [Realtime models](https://docs.livekit.io/agents/models/realtime)
-- Eval suite based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/)
-- [LiveKit Turn Detector](https://docs.livekit.io/agents/logic/turns/turn-detector/) for contextually-aware speaker detection, with multilingual support
-- [Background voice cancellation](https://docs.livekit.io/transport/media/noise-cancellation/)
-- Deep session insights from LiveKit [Agent Observability](https://docs.livekit.io/deploy/observability/)
-- A Dockerfile ready for [production deployment to LiveKit Cloud](https://docs.livekit.io/deploy/agents/)
-
-This starter app is compatible with any [custom web/mobile frontend](https://docs.livekit.io/frontends/) or [telephony](https://docs.livekit.io/telephony/).
+Mic noise suppression happens in the browser (WebRTC), not in the agent.
 
 ## Using coding agents
 
@@ -54,109 +47,64 @@ See the [Using coding agents](https://docs.livekit.io/intro/coding-agents/) guid
 
 The project includes a complete [AGENTS.md](AGENTS.md) file for these assistants. You can modify this file to suit your needs. To learn more about this file, see [https://agents.md](https://agents.md).
 
-## Dev Setup
+## Dev setup
 
-Create a project from this template with the LiveKit CLI (recommended):
+1. Start the local LiveKit server. See `../infra/livekit/README.md` (Docker Compose, ports, macOS notes).
+2. Install dependencies:
 
-```bash
-lk cloud auth
-lk agent init my-agent --template agent-starter-python
-```
+   ```console
+   uv sync
+   ```
 
-The CLI clones the template and configures your environment. Then follow the rest of this guide from [Run the agent](#run-the-agent).
+3. Set up env. The agent loads `.env.local` (`load_dotenv(".env.local")` in `src/agent.py`). In this repo `agent/.env.local` is a symlink to the root `.env.local`, which `api/` and `web/` share. The root `.env` holds remote/prod values and no app links to it, so local runs never read it. Production doesn't use either file; the hosting platform sets the env. Key names are in the root `.env.example`. If you run the agent on its own, copy `agent/.env.example` to `agent/.env.local` instead. The keys:
 
-<details>
-<summary>Alternative: Manual setup without the CLI</summary>
+   - `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`: the example values (`ws://localhost:7880`, `devkey`, `secret`) match the local server.
+   - `DEEPGRAM_API_KEY`, `OPENROUTER_API_KEY`, `CARTESIA_API_KEY`: provider keys. OpenRouter carries only the LLM: it has no streaming STT, and no streaming Cartesia TTS.
+   - `API_BASE_URL`: the Hono API the tools call (default `http://localhost:4000`).
+   - `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`: optional tracing. Locally they point at the self-hosted Langfuse in `../infra/langfuse`; leave them unset to turn tracing off.
 
-Clone the repository and install dependencies to a virtual environment:
-
-```console
-cd agent-starter-python
-uv sync
-```
-
-Sign up for [LiveKit Cloud](https://cloud.livekit.io/) then set up the environment by copying `.env.example` to `.env.local` and filling in the required keys:
-
-- `LIVEKIT_URL`
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
-
-You can load the LiveKit environment automatically using the [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/):
-
-```bash
-lk cloud auth
-lk app env -w -d .env.local
-```
-
-</details>
+   The worker reads env once, at startup. `dev` auto-reload restarts the worker as a child of the first process, which keeps the env it loaded first (`load_dotenv` doesn't override variables that are already set). After changing `.env.local`, stop `dev` and start it again.
 
 ## Run the agent
 
-Before your first run, you must download certain models such as [Silero VAD](https://docs.livekit.io/agents/logic/turns/vad/) and the [LiveKit turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/):
+Before the first run, download the Silero VAD and turn detector models. The turn detector loads its model from disk only and fails to initialise without it:
 
 ```console
-uv run python src/agent.py download-files
+uv run src/agent.py download-files
 ```
 
-Next, run this command to speak to your agent directly in your terminal:
+Then run the worker. Use `dev` locally (auto-reload) and `start` in production:
 
 ```console
-uv run python src/agent.py console
+uv run src/agent.py dev
+uv run src/agent.py start
 ```
 
-To run the agent for use with a frontend or telephony, use the `dev` command:
+The worker registers as `cadence`. The API dispatches it explicitly into each room, so start the API and web app too (see their READMEs).
 
-```console
-uv run python src/agent.py dev
-```
+## Tracing (Langfuse)
 
-In production, use the `start` command:
+With the three `LANGFUSE_*` keys set, each call becomes one Langfuse trace (`src/telemetry.py`): the SDK's spans (`agent_session`, `user_turn`, `eou_detection`, `agent_turn`, `llm_node`, `llm_request`, `function_tool`, `tts_node`, …) under a `cadence_call` root span, exported over OTLP/HTTP to `<LANGFUSE_BASE_URL>/api/public/otel/v1/traces`. Every span carries `langfuse.session.id` = room name, so a call's observations group into one session named after the room. `ApiClient` (`src/api_client.py`) wraps each API request in a client span (`POST /appointments`, …) and sends `traceparent`, so the API's route and DB spans join the same trace under the tool's `function_tool` span (see `../api/README.md`). It also sends `X-Cadence-Room: <room name>` on every request, tracing or not. Errors (STT/LLM/TTS, tool/API 4xx/5xx) appear as `cadence_error` observations at level ERROR, and each LLM call gets an `openrouter_generation` child with the upstream provider, latency and real cost (`src/openrouter_stats.py`). With the keys unset, tracing is off and nothing is exported. Locally, run the Langfuse stack in `../infra/langfuse` and open http://localhost:3100.
 
-```console
-uv run python src/agent.py start
-```
-
-## Frontend & Telephony
-
-Get started quickly with our pre-built frontend starter apps, or add telephony support:
-
-| Platform | Link | Description |
-|----------|----------|-------------|
-| **Web** | [`livekit-examples/agent-starter-react`](https://github.com/livekit-examples/agent-starter-react) | Web voice AI assistant with React & Next.js |
-| **iOS/macOS** | [`livekit-examples/agent-starter-swift`](https://github.com/livekit-examples/agent-starter-swift) | Native iOS, macOS, and visionOS voice AI assistant |
-| **Flutter** | [`livekit-examples/agent-starter-flutter`](https://github.com/livekit-examples/agent-starter-flutter) | Cross-platform voice AI assistant app |
-| **React Native** | [`livekit-examples/voice-assistant-react-native`](https://github.com/livekit-examples/voice-assistant-react-native) | Native mobile app with React Native & Expo |
-| **Android** | [`livekit-examples/agent-starter-android`](https://github.com/livekit-examples/agent-starter-android) | Native Android app with Kotlin & Jetpack Compose |
-| **Web Embed** | [`livekit-examples/agent-starter-embed`](https://github.com/livekit-examples/agent-starter-embed) | Voice AI widget for any website |
-| **Telephony** | [Documentation](https://docs.livekit.io/telephony/) | Add inbound or outbound calling to your agent |
-
-For advanced customization, see the [complete frontend guide](https://docs.livekit.io/frontends/).
+LiveKit Agents 1.5.6 can't strip content from spans: transcripts, tool arguments (phone numbers, names) and the full chat context are exported as-is.
 
 ## Tests and evals
 
-This project includes a complete suite of evals, based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/). To run them, use `pytest`.
+The agent and the LLM judge both use the OpenRouter-backed LLM, so the tests need `OPENROUTER_API_KEY` only:
 
 ```console
 uv run pytest
 ```
 
-## Using this template repo for your own project
-
-Once you've started your own project based on this repo, you should:
-
-1. **Check in your `uv.lock`**: This file is currently untracked for the template, but you should commit it to your repository for reproducible builds and proper configuration management. (The same applies to `livekit.toml`, if you run your agents in LiveKit Cloud)
-
-2. **Remove the git tracking test**: Delete the "Check files not tracked in git" step from `.github/workflows/tests.yml` since you'll now want this file to be tracked. These are just there for development purposes in the template repo itself.
-
-3. **Add your own repository secrets**: You must [add secrets](https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-what-your-workflow-does/using-secrets-in-github-actions) for `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` so that the tests can run in CI.
+CI (`../.github/workflows/agent.yml`, at the repo root because GitHub only runs workflows from there) runs ruff and these tests, reading the key from the `OPENROUTER_API_KEY` repository secret.
 
 ## Deploying to production
 
-This project is production-ready and includes a working `Dockerfile`. To deploy it to LiveKit Cloud or another environment, see the [deploying to production](https://docs.livekit.io/deploy/agents/) guide.
+Build and run the `Dockerfile` next to our own LiveKit server. It runs `download-files` at build time and `start` at run time. Don't use `lk agent deploy`, which targets LiveKit Cloud.
 
-## Self-hosted LiveKit
+Set `LIVEKIT_URL` (`wss://…` of the production server), its API key/secret, the three provider keys and `API_BASE_URL`. Never set `LIVEKIT_REMOTE_EOT_URL`, `LIVEKIT_INFERENCE_URL` or `LIVEKIT_OBSERVABILITY_URL`: each one makes the worker call LiveKit Cloud hosts.
 
-You can also self-host LiveKit instead of using LiveKit Cloud. See the [self-hosting](https://docs.livekit.io/transport/self-hosting/local/) guide for more information. If you choose to self-host, you'll need to also use [model plugins](https://docs.livekit.io/agents/models/#plugins) instead of LiveKit Inference and will need to remove the [LiveKit Cloud noise cancellation](https://docs.livekit.io/transport/media/noise-cancellation/) plugin.
+Server-side production setup (TLS, TURN, ports) is listed under "Production differs" in `../infra/livekit/README.md`.
 
 ## License
 
