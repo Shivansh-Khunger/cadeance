@@ -18,6 +18,17 @@ Bun skips `.env.local` when `NODE_ENV=test`. Bun's docs don't say that `--hot` r
 
 `bun run db:push` and `bun run db:studio` run drizzle-kit under Node, so `drizzle.config.ts` loads `.env.local` itself with `dotenv`. Today the root `.env` and `.env.local` hold the same `DATABASE_URL`, so `db:push` from your machine changes the shared remote database, not a local one.
 
+## Production (Docker)
+
+`Dockerfile` runs `src/index.ts` with Bun (no build step), production dependencies only, as the image's non-root `bun` user, on port 4000 (`PORT` overrides it). The image reads no env files; set the keys from `.env.example` on the hosting platform: `DATABASE_URL`, `CORS_ORIGIN` (the web app's origin, e.g. the Vercel URL), `LIVEKIT_URL` (the public `wss://` URL, which the API hands to browsers), `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, and optionally the three `LANGFUSE_*` keys.
+
+```sh
+docker build -t cadence-api .
+docker run -p 4000:4000 --env-file ../.env.local cadence-api
+```
+
+Building on an Apple Silicon Mac for an x86 host: add `--platform linux/amd64`.
+
 ## Tracing (Langfuse)
 
 With `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_BASE_URL` all set, `src/telemetry.ts` exports OpenTelemetry spans to `<LANGFUSE_BASE_URL>/api/public/otel/v1/traces`. With any of them unset it does nothing: no provider, no middleware, and `withDbSpan` just runs the query.
