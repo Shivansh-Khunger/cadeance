@@ -6,16 +6,14 @@ import {
   BarVisualizer,
   LiveKitRoom,
   RoomAudioRenderer,
-  VideoTrack,
   useLocalParticipant,
   useRoomContext,
   useTrackToggle,
   useTranscriptions,
   useVoiceAssistant,
 } from "@livekit/components-react";
-import { useKrispNoiseFilter } from "@livekit/components-react/krisp";
 import "@livekit/components-styles";
-import { Track } from "livekit-client";
+import { Track, type AudioCaptureOptions } from "livekit-client";
 import { AnimatePresence, motion } from "motion/react";
 import type { TextStreamData } from "@livekit/components-react";
 
@@ -63,6 +61,17 @@ type Summary = {
 
 const TOOL_TOPIC = "cadence.tool";
 const SUMMARY_TOPIC = "cadence.summary";
+
+// Browser (WebRTC) mic processing. These replace LiveKit's enhanced noise
+// cancellation filter, which only works on LiveKit Cloud. livekit-client
+// already enables all three by default (src/room/defaults.ts `audioDefaults`);
+// they are set explicitly to make the intent visible. Module-level so the
+// object identity is stable across renders.
+const MIC_CONSTRAINTS: AudioCaptureOptions = {
+  noiseSuppression: true,
+  echoCancellation: true,
+  autoGainControl: true,
+};
 
 export default function AgentPage() {
   const [details, setDetails] = useState<ConnectionDetails | null>(null);
@@ -224,7 +233,7 @@ export default function AgentPage() {
                 serverUrl={details.server_url}
                 token={details.participant_token}
                 connect
-                audio
+                audio={MIC_CONSTRAINTS}
                 onDisconnected={() => void handleDisconnected()}
                 data-lk-theme="default"
                 className="flex flex-1 flex-col"
@@ -318,9 +327,7 @@ function ActiveSession({
   roomName: string;
   onSummary: (s: Summary) => void;
 }) {
-  const { state, audioTrack, videoTrack } = useVoiceAssistant();
-  const status = state ?? "connecting";
-  const isSpeaking = status === "speaking";
+  const { state, audioTrack } = useVoiceAssistant();
 
   return (
     <div className="flex flex-1 flex-col items-center justify-between gap-8 py-6">
@@ -333,60 +340,34 @@ function ActiveSession({
           <span className="hidden font-mono uppercase tracking-[0.18em] text-(--muted) sm:inline">
             {roomName.replace(/^room-/, "").slice(0, 12)}
           </span>
-          <NoiseFilter />
         </div>
       </header>
 
       <div className="grid w-full max-w-6xl flex-1 grid-cols-1 items-stretch gap-6 md:grid-cols-[minmax(0,1fr)_420px]">
         <div className="flex flex-col items-center justify-center gap-6">
-          <AnimatePresence mode="wait">
-            {videoTrack ? (
-              <motion.div
-                key="video"
-                initial={{ opacity: 0, scale: 0.96 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.96 }}
-                transition={{ duration: 0.3 }}
-                className={`relative aspect-square w-full max-w-md overflow-hidden rounded-[2rem] border border-(--border) bg-(--surface) shadow-[0_40px_100px_-40px_rgba(0,0,0,0.55)] transition-shadow ${
-                  isSpeaking ? "glow-ring-active" : ""
-                }`}
-              >
-                <VideoTrack
-                  trackRef={videoTrack}
-                  className="h-full w-full object-cover"
-                />
-                <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-center gap-2 bg-gradient-to-t from-black/45 via-black/15 to-transparent p-4">
-                  <BarVisualizer
-                    state={state}
-                    barCount={5}
-                    trackRef={audioTrack}
-                    options={{ minHeight: 6, maxHeight: 30 }}
-                    className="h-8 w-32 [&_.lk-audio-bar]:!bg-white/60 [&_.lk-audio-bar.lk-highlighted]:!bg-white"
-                  />
-                </div>
-              </motion.div>
-            ) : (
-              <motion.div
-                key="waiting"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.3 }}
-                className="flex h-64 w-full max-w-xl flex-col items-center justify-center gap-5"
-              >
-                <BarVisualizer
-                  state={state}
-                  barCount={9}
-                  trackRef={audioTrack}
-                  options={{ minHeight: 8, maxHeight: 90 }}
-                  className="h-40 w-full"
-                />
-                <p className="text-base text-(--muted-strong) sm:text-lg">
+          <div className="flex h-64 w-full max-w-xl flex-col items-center justify-center gap-5">
+            <BarVisualizer
+              state={state}
+              barCount={9}
+              trackRef={audioTrack}
+              options={{ minHeight: 8, maxHeight: 90 }}
+              className="h-40 w-full"
+            />
+            <AnimatePresence>
+              {!audioTrack && (
+                <motion.p
+                  key="waiting"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="text-base text-(--muted-strong) sm:text-lg"
+                >
                   Agent will join shortly…
-                </p>
-              </motion.div>
-            )}
-          </AnimatePresence>
+                </motion.p>
+              )}
+            </AnimatePresence>
+          </div>
         </div>
 
         <Conversation onSummary={onSummary} />
@@ -471,127 +452,12 @@ function HangupIcon() {
   );
 }
 
-function NoiseFilter() {
-  const { setNoiseFilterEnabled, isNoiseFilterEnabled, isNoiseFilterPending } =
-    useKrispNoiseFilter();
-
-  useEffect(() => {
-    if (!isNoiseFilterEnabled && !isNoiseFilterPending) {
-      setNoiseFilterEnabled(true).catch(() => {});
-    }
-  }, [setNoiseFilterEnabled, isNoiseFilterEnabled, isNoiseFilterPending]);
-
-  if (!isNoiseFilterEnabled && !isNoiseFilterPending) {
-    return null;
-  }
-
-  return (
-    <span className="inline-flex items-center gap-2 font-mono uppercase tracking-[0.2em] text-(--muted)">
-      <span
-        className={`size-1.5 rounded-full ${
-          isNoiseFilterPending ? "bg-(--accent) animate-pulse" : "bg-emerald-500"
-        }`}
-      />
-      NC
-    </span>
-  );
-}
-
 type Message = {
   id: string;
   text: string;
   isUser: boolean;
   timestamp: number;
 };
-
-// Sync transcripts arrive paced with the agent's TTS, but the Beyond Presence
-// avatar adds latency before the audio actually plays — so transcripts land in
-// the UI before the user hears anything. Hold each agent text update for ~1.5s
-// before applying so the bubble tracks the avatar's playback instead.
-const AVATAR_TRANSCRIPT_DELAY_MS = 1500;
-
-type Slot = { applyAt: number; message: Message };
-type AlignedState = {
-  pending: Map<string, Slot[]>;
-  applied: Map<string, Message>;
-  seen: Map<string, string>;
-};
-
-function useAvatarAlignedMessages(
-  rawMessages: Message[],
-  delayMs: number,
-): Message[] {
-  const [state, setState] = useState<AlignedState>(() => ({
-    pending: new Map(),
-    applied: new Map(),
-    seen: new Map(),
-  }));
-
-  useEffect(() => {
-    const now = Date.now();
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- we're syncing prop into derived state with time-anchored slots
-    setState((prev) => {
-      const pending = new Map<string, Slot[]>();
-      for (const [id, q] of prev.pending) pending.set(id, [...q]);
-      const applied = new Map(prev.applied);
-      const seen = new Map(prev.seen);
-      let changed = false;
-
-      for (const m of rawMessages) {
-        if (seen.get(m.id) === m.text) continue;
-        seen.set(m.id, m.text);
-        changed = true;
-        if (m.isUser) {
-          applied.set(m.id, m);
-        } else {
-          const q = pending.get(m.id) ?? [];
-          q.push({ applyAt: now + delayMs, message: m });
-          pending.set(m.id, q);
-        }
-      }
-
-      return changed ? { pending, applied, seen } : prev;
-    });
-  }, [rawMessages, delayMs]);
-
-  useEffect(() => {
-    let nextDeadline = Number.POSITIVE_INFINITY;
-    for (const q of state.pending.values()) {
-      if (q.length > 0) nextDeadline = Math.min(nextDeadline, q[0].applyAt);
-    }
-    if (!Number.isFinite(nextDeadline)) return;
-    const wait = Math.max(0, nextDeadline - Date.now()) + 30;
-    const timer = setTimeout(() => {
-      const now = Date.now();
-      setState((prev) => {
-        const pending = new Map<string, Slot[]>();
-        for (const [id, q] of prev.pending) pending.set(id, [...q]);
-        const applied = new Map(prev.applied);
-        let changed = false;
-        for (const [id, q] of pending) {
-          while (q.length > 0 && q[0].applyAt <= now) {
-            applied.set(id, q.shift()!.message);
-            changed = true;
-          }
-          if (q.length === 0) {
-            pending.delete(id);
-            changed = true;
-          }
-        }
-        return changed ? { ...prev, pending, applied } : prev;
-      });
-    }, wait);
-    return () => clearTimeout(timer);
-  }, [state.pending]);
-
-  return useMemo(
-    () =>
-      Array.from(state.applied.values()).sort(
-        (a, b) => a.timestamp - b.timestamp,
-      ),
-    [state.applied],
-  );
-}
 
 type TimelineItem =
   | {
@@ -649,8 +515,8 @@ function Conversation({ onSummary }: { onSummary: (s: Summary) => void }) {
 
   // Subscribe to summary text stream, lift to parent, then end the call
   // from the user side. The agent publishes the summary right before saying
-  // goodbye — giving it a few seconds covers the goodbye TTS plus the avatar
-  // lip-sync delay before we disconnect the room.
+  // goodbye — giving it a few seconds covers the goodbye TTS before we
+  // disconnect the room.
   useEffect(() => {
     const handler = (reader: { readAll: () => Promise<string> }) => {
       void (async () => {
@@ -703,7 +569,7 @@ function Conversation({ onSummary }: { onSummary: (s: Summary) => void }) {
     return () => clearInterval(interval);
   }, []);
 
-  const rawMessages = useMemo<Message[]>(() => {
+  const messages = useMemo<Message[]>(() => {
     const bySegment = new Map<string, TextStreamData>();
     for (const entry of transcriptions) {
       const segmentId =
@@ -719,11 +585,6 @@ function Conversation({ onSummary }: { onSummary: (s: Summary) => void }) {
       }))
       .sort((a, b) => a.timestamp - b.timestamp);
   }, [transcriptions, localIdentity]);
-
-  const messages = useAvatarAlignedMessages(
-    rawMessages,
-    AVATAR_TRANSCRIPT_DELAY_MS,
-  );
 
   const timeline = useMemo<TimelineItem[]>(() => {
     const items: TimelineItem[] = [];
