@@ -1,0 +1,33 @@
+# livekit-server config for LOCAL DEVELOPMENT ONLY (macOS Docker Desktop).
+# Keys checked against https://github.com/livekit/livekit/blob/v1.13.10/config-sample.yaml
+# Production config differs; see README.md and ticket 05.
+
+# Signal server (WebSocket + Twirp HTTP API).
+port: 7880
+
+# Enables dev conveniences (pprof under /debug, no "secret too short" error for
+# the dev key below). Our explicit `keys` keep the server listening on all
+# container interfaces (dev mode only binds to loopback when no keys are given).
+development: true
+
+logging:
+  level: info
+
+rtc:
+  # ICE over TCP, used when UDP is blocked.
+  tcp_port: 7881
+  # Small UDP range: Docker Desktop on macOS is slow to publish large ranges.
+  # Must match the UDP range published in docker-compose.yml.
+  port_range_start: 50000
+  port_range_end: 50100
+  # The container's own IP (172.x) is not reachable from the macOS host, so
+  # advertise 127.0.0.1 in ICE candidates. Docker Desktop forwards
+  # 127.0.0.1:<port> on the host into the container. STUN discovery is off.
+  use_external_ip: false
+  node_ip: 127.0.0.1
+
+# Dev API key pair. Same values as agent/.env.example and api/.env.example.
+keys:
+  devkey: secret
+
+# No redis: a single node does not need it, and agent dispatch works without it.
