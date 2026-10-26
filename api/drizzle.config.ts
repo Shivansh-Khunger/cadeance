@@ -1,5 +1,11 @@
-import 'dotenv/config';
+import { config } from 'dotenv';
 import { defineConfig } from 'drizzle-kit';
+
+// drizzle-kit runs under Node (its bin has a node shebang), so Bun's env
+// auto-loading doesn't reach it. Load the same file the API reads locally:
+// api/.env.local, a symlink to the root .env.local. In production or CI the
+// file is absent and DATABASE_URL comes from the real environment.
+config({ path: '.env.local', quiet: true });
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
