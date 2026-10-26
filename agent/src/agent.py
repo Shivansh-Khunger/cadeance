@@ -70,7 +70,7 @@ _background_tasks: set[asyncio.Task[None]] = set()
 AGENT_MODEL = "deepseek/deepseek-v4.1-flash-20260910:nitro"
 AGENT_REASONING_EFFORT: openai.llm.ReasoningEffort = "none"
 _OPENROUTER_PROVIDER: openai.OpenRouterProviderPreferences = {
-    "sort": ["latency"],
+    "sort": "latency",
     "allow_fallbacks": False,
     "require_parameters": True,
 }
